@@ -71,7 +71,7 @@ parameters.batch_scale_factor = 8
 parameters.decay = 0.001
 
 
-parameters.start_epoch = 5             # Epoch to start DNS or INQ
+parameters.start_epoch = 3             # Epoch to start DNS or INQ
 
 # DNS parameters
 parameters.gamma = 0.0001

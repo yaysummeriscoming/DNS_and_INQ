@@ -2,7 +2,8 @@ import keras.backend as K
 from keras.layers import Convolution2D
 from keras.engine import InputSpec
 import numpy as np
-from random import uniform
+from keras import initializers
+
 
 class DNSConv2D(Convolution2D):
     """2D convolution layer with Dynamic Network Surgery Functionality
@@ -17,16 +18,16 @@ class DNSConv2D(Convolution2D):
     The weight significance function basically considers how large a weight is.  Namely how many standard deviations
     it is away from the weight mean.
 
-    NOTE: The pruning functionality is implemented using a 'on batch end' function,
-    which must be called at the end of every batch (ideally using a callback).  Currently this functionality
-    is implemented using Numpy.  In practice this incurs a negligible performance penalty,
-    as this function uses far fewer operations than the base convolution operation.
+    NOTE: There are two methods of engaging DNS: Start epoch or by calling the start_DNS() method
 
     # Arguments
         start_epoch: Training epoch at which to start applying DNS
         gamma: Decay constant for the mask switching probability calculation
         crate: Standard deviations away from the mean at which to start pruning weights.
             Taken from the author's C++ code.  This variable controls the amount of weights that are pruned.
+        power: DNS filter update probability decay exponent.  Larger values will cause DNS to finish sooner
+        print_batch: Print DNS statistics at the end of every batch
+        print_epoch: Print DNS statistics at the end of every epoch
 
     # Input shape
         4D tensor with shape:
@@ -39,90 +40,151 @@ class DNSConv2D(Convolution2D):
     """
 
     def __init__(self,
-                 start_epoch,
-                 gamma=0.0001,
-                 crate=3.,
+                 start_epoch=-1,     # Epoch at which to begin DNS.  Can also start DNS by calling method below
+                 gamma=0.0001,       # Speed at which mask switch probability drops
+                 crate=3.,           # Some sort of outlier/significancy threshold (nominally 4 in their code)
+                 power=-1,           # Probability decay exponent
+                 print_batch=False,  # Print DNS statistics at the end of every batch
+                 print_epoch=True,   # Print DNS statistics at the end of every epoch
                  **kwargs):
 
         super().__init__(**kwargs)
 
         self.input_spec = InputSpec(ndim=4)
 
-        assert self.data_format == 'channels_last'
         self.start_epoch = start_epoch
-
-        # Probability of updating T:
-        self.gamma = gamma  # Speed at which mask switch probability drops
-        self.crate = crate  # Some sort of outlier/significancy threshold (nominally 4 in their code)
-
-        self.power = -1  # Probability decay exponent
-        self.curIter = -1
-
+        self.gamma = gamma
+        self.crate = crate
+        self.power = power
+        self.print_batch = print_batch
+        self.print_epoch = print_epoch
 
 
     def build(self, input_shape):
         # Call the build function of the base class (in this case, convolution)
         super().build(input_shape)  # Be sure to call this somewhere!
 
-        self.unmasked_weights = K.get_value(self.weights[0]).copy()
-        self.lastIterationWeights = K.get_value(self.weights[0]).copy()
+        # Current DNS iteration
+        self.cur_iter = self.add_weight(shape=None,
+                                        initializer=initializers.get('zeros'),
+                                        trainable=False,
+                                        name='current_DNS_iteration',
+                                        )#dtype='int32')
+        K.set_value(x=self.cur_iter, value=-1)
 
         # Mask variable.  Initialise to 1 so that every weight is unmasked during training before DNS starts
-        self.T = np.ones(shape=self.unmasked_weights.shape)
-
+        self.T = self.add_weight(shape=self.kernel.shape,
+                                 initializer=initializers.get('ones'),
+                                 name='T',
+                                 trainable=False)
 
 
     def get_config(self):
         config = {'start_epoch': self.start_epoch,
                   'gamma': self.gamma,
-                  'crate': self.crate}
+                  'crate': self.crate,
+                  'power': self.power,
+                  'print_batch': self.print_batch,
+                  'print_epoch': self.print_epoch,
+                  }
         base_config = super().get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
 
+    def call(self, inputs):
+        # Perform the base convolution
+        outputs = K.conv2d(
+            inputs,
+            self.T * self.kernel,
+            strides=self.strides,
+            padding=self.padding,
+            data_format=self.data_format,
+            dilation_rate=self.dilation_rate)
+
+        # Add the bias
+        if self.use_bias:
+            outputs = K.bias_add(
+                outputs,
+                self.bias,
+                data_format=self.data_format)
+
+        # Add the appropriate activation, if specified
+        if self.activation is not None:
+            outputs = self.activation(outputs)
+
+        # Update the current DNS iteration
+        cur_iter_new = K.switch(self.cur_iter >= 0., self.cur_iter + 1., self.cur_iter)
+        self.add_update(K.update(self.cur_iter, cur_iter_new), )
+
+        # Update the weight mask
+        self.add_update(K.update(self.T, DNS_update(cur_iter=self.cur_iter,
+                                                    gamma=self.gamma,
+                                                    crate=self.crate,
+                                                    power=self.power,
+                                                    kernel=self.kernel,
+                                                    T=self.T,
+                                                    learning_phase=K.learning_phase())),
+                        # cur_iter_new > 0, # having some trouble with making the update conditional here
+                        )
+
+        return outputs
+
+
     def on_batch_end(self, batch):
-        # First update the unmasked weights
-        weightsUpdate = K.get_value(self.weights[0]) - self.lastIterationWeights
-        self.unmasked_weights += weightsUpdate
+        if self.print_batch:
+            T = K.get_value(x=self.T)
+            cur_iter = K.get_value(self.cur_iter)
 
-        if self.curIter >= 0:
-            # The paper isn't too clear on this, so this has been dug out of their C++ source code
-            probThreshold = (1 + self.gamma * self.curIter) ** self.power
+            if cur_iter != -1.:
+                print('Percentage of weights unmasked at the end of this batch is: %f' % (100.0 * np.sum(T) / T.size))
+                print('Number of weights unmasked at the end of this batch is: %d, which is iteration %d of DNS' % (np.sum(T), cur_iter))
 
-            # Roll the output channels dimension to the front to allow for easy looping
-            # Weight arrangement is (channels last notation:
-            # (kernel_size, kernel_size, num_input_channels, num_output_channels)
-            weights_reshuffled = np.swapaxes(self.unmasked_weights, 0, -1)
-            t_reshuffled = np.swapaxes(self.T, 0, -1)
 
-            # Loop over each output mask & filter in the layer
-            for curT, curFilter in zip(t_reshuffled, weights_reshuffled):
+    def start_DNS(self):
+        K.set_value(x=self.cur_iter, value=0.)
 
-                # Now generate a random number and see if we're going to update this filter
-                randomNumber = uniform(0.0, 1.0)
-                if randomNumber < probThreshold:
-                    mu = np.mean(curFilter)              # mean
-                    std = np.std(curFilter)              # standard deviation
-                    threshold = mu + self.crate * std    # weights this many std. deviations from the mean are 'significant'
-                    alpha = 0.9 * threshold
-                    beta  = 1.1 * threshold
 
-                    # Mask & unmask weights according to magnitude.
-                    # Note that there is a deadband in which weights aren't touched
-                    curT[np.abs(curFilter) < alpha] = 0
-                    curT[np.abs(curFilter) > beta] = 1
+    def on_epoch_begin(self, epoch):
+        cur_iter = K.get_value(x=self.cur_iter)
 
-            self.curIter += 1
-
-        # Apply the output mask & save the resulting masked weights ready for the next batch
-        output_weights = self.T * self.unmasked_weights
-        self.lastIterationWeights = output_weights.copy()
-        K.set_value(self.weights[0], output_weights)
+        if epoch >= self.start_epoch and cur_iter == -1.:
+            self.start_DNS()
 
 
     def on_epoch_end(self, epoch):
-        if epoch >= self.start_epoch and self.curIter == -1:
-            self.curIter = 0
+        T = K.get_value(x=self.T)
+        cur_iter = K.get_value(self.cur_iter)
 
-        print('Percentage of weights unmasked at the end of this batch is: %f\n' % (100.0 * np.sum(self.T) / self.T.size))
-        print('Number of weights unmasked at the end of this batch is: %d, which is iteration %d of DNS\n' % (np.sum(self.T), self.curIter))
+        if cur_iter != -1. and self.print_epoch:
+            print('Percentage of weights unmasked at the end of this epoch is: %f' % (100.0 * np.sum(T) / T.size))
+            print('Number of weights unmasked at the end of this epoch is: %d, which is iteration %d of DNS' % (np.sum(T), cur_iter))
+
+
+def DNS_update(cur_iter, gamma, crate, power, kernel, T, learning_phase):
+    # The paper isn't too clear on this, so this has been dug out of their C++ source code
+    probThreshold = (1 + gamma * cur_iter) ** power
+
+    # Determine which filters shall be updated this iteration
+    random_number = K.random_uniform(shape=(1, 1, 1, int(T.shape[-1])))
+    random_number = K.cast(random_number < probThreshold, dtype='float32')
+
+    # Based on the mean & standard deviation of the weights, determine a weight significancy threshold
+    mu_vec = K.mean(x=kernel, axis=(0, 1, 2), keepdims=True)
+    std_vec = K.std(x=kernel, axis=(0, 1, 2), keepdims=True)
+    threshold_vec = mu_vec + crate * std_vec  # weights this many std. deviations from the mean are 'significant'
+
+    # Incorporate hysteresis into the threshold
+    alpha_vec = 0.9 * threshold_vec
+    beta_vec = 1.1 * threshold_vec
+
+    # Update the significant weight mask by applying the threshold to the unmasked weights
+    abs_kernel = K.abs(x=kernel)
+    new_T = T - K.cast(abs_kernel < alpha_vec, dtype='float32') * random_number
+    new_T = new_T + K.cast(abs_kernel > beta_vec, dtype='float32') * random_number
+    new_T = K.clip(x=new_T, min_value=0., max_value=1.)
+
+    # Only apply DNS when training and when activated via the current iteration variable
+    new_T = K.switch(cur_iter >= 0., new_T, T)
+    new_T = K.switch(learning_phase, new_T, T)
+
+    return new_T
